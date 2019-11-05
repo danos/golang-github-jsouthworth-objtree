@@ -1,0 +1,340 @@
+diff --git a/interface.go b/interface.go
+index 423ab2c..cbaaac2 100644
+--- a/interface.go
++++ b/interface.go
+@@ -32,6 +32,26 @@ func (intf *Interface) LookupMethod(name string) (dbus.Method, bool) {
+ 	return method, ok
+ }
+ 
++func (intf *Interface) lookupSignal(name string) (*Method, bool) {
++	signal, ok := intf.impl.LookupSignal(name)
++	if !ok {
++		return nil, false
++	}
++	// Methods have two mutable fields that are caller specific
++	// Make a new method with the immutable fields from the stored
++	// method.
++	new_signal := &Method{
++		impl: signal,
++		name: name,
++	}
++	return new_signal, ok
++}
++
++func (intf *Interface) LookupSignal(name string) (dbus.Method, bool) {
++	signal, ok := intf.lookupSignal(name)
++	return signal, ok
++}
++
+ func (intf *Interface) Introspect() introspect.Interface {
+ 	getMethods := func() []introspect.Method {
+ 		methods := intf.impl.Methods()
+@@ -44,9 +64,21 @@ func (intf *Interface) Introspect() introspect.Interface {
+ 		return out
+ 	}
+ 
++	getSignals := func() []introspect.Signal {
++		signals := intf.impl.Signals()
++		out := make([]introspect.Signal, 0, len(signals))
++		for name, _ := range signals {
++			signal, _ := intf.lookupSignal(name)
++			out = append(out, signal.IntrospectSignal())
++		}
++		sort.Sort(signalsByName(out))
++		return out
++	}
++
+ 	return introspect.Interface{
+ 		Name:    intf.name,
+ 		Methods: getMethods(),
++		Signals: getSignals(),
+ 	}
+ }
+ 
+@@ -55,3 +87,9 @@ type methodsByName []introspect.Method
+ func (a methodsByName) Len() int           { return len(a) }
+ func (a methodsByName) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+ func (a methodsByName) Less(i, j int) bool { return a[i].Name < a[j].Name }
++
++type signalsByName []introspect.Signal
++
++func (a signalsByName) Len() int           { return len(a) }
++func (a signalsByName) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
++func (a signalsByName) Less(i, j int) bool { return a[i].Name < a[j].Name }
+diff --git a/internal/reflect/reflect.go b/internal/reflect/reflect.go
+index 5c7ec70..92a046b 100644
+--- a/internal/reflect/reflect.go
++++ b/internal/reflect/reflect.go
+@@ -9,28 +9,43 @@ var errtype = reflect.TypeOf((*error)(nil)).Elem()
+ 
+ type Object struct {
+ 	methods map[string]*Method
++	signals map[string]*Method
+ }
+ 
+ func NewObject(value interface{}) *Object {
+ 	return newObjectFromTable(GetMethodsFromReceiver(value),
++		nil,
+ 		func(in string) string { return in })
+ }
+ 
+ func NewObjectMapNames(value interface{}, mapfn func(string) string) *Object {
+-	return newObjectFromTable(GetMethodsFromReceiver(value), mapfn)
++	return newObjectFromTable(GetMethodsFromReceiver(value), nil, mapfn)
+ }
+ 
+ func NewObjectFromTable(table map[string]interface{}) *Object {
+ 	return newObjectFromTable(filterMethodTable(table),
++		nil,
++		func(in string) string { return in })
++}
++
++func NewObjectFromMethodsSignals(methods, signals map[string]interface{}) *Object {
++	return newObjectFromTable(filterMethodTable(methods),
++		filterMethodTable(signals),
++		func(in string) string { return in })
++}
++
++func NewSignalObjectFromTable(signals map[string]interface{}) *Object {
++	return newObjectFromTable(nil, filterMethodTable(signals),
+ 		func(in string) string { return in })
+ }
+ 
+ func newObjectFromTable(
+-	table map[string]interface{},
++	methods, signals map[string]interface{},
+ 	mapfn func(string) string,
+ ) *Object {
+ 	obj := &Object{
+-		methods: mapMethodValueNames(toMethodValues(table), mapfn),
++		methods: mapMethodValueNames(toMethodValues(methods), mapfn),
++		signals: mapMethodValueNames(toMethodValues(signals), mapfn),
+ 	}
+ 	return obj
+ }
+@@ -43,11 +58,35 @@ func (o *Object) getMethodTypes() map[string]reflect.Type {
+ 	return out
+ }
+ 
++func (o *Object) getSignalTypes() map[string]reflect.Type {
++	out := make(map[string]reflect.Type)
++	for k, v := range o.signals {
++		out[k] = v.value.Type()
++	}
++	return out
++}
++
+ func (o *Object) Implements(iface *InterfaceType) bool {
+ 	if iface == nil {
+ 		return false
+ 	}
+-	return isSubsetOfMethods(iface.methods, o.getMethodTypes())
++	meth := isSubsetOfMethods(iface.methods, o.getMethodTypes())
++
++	sigs := isSubsetOfMethods(iface.signals, o.getSignalTypes())
++	if !meth {
++		return false
++	}
++	if !sigs {
++		return false
++	}
++	return true
++}
++
++func (o *Object) ImplementsSignal(iface *InterfaceType) bool {
++	if iface == nil {
++		return false
++	}
++	return isSubsetOfMethods(iface.signals, o.getSignalTypes())
+ }
+ 
+ func (o *Object) LookupMethod(name string) (*Method, bool) {
+@@ -55,6 +94,11 @@ func (o *Object) LookupMethod(name string) (*Method, bool) {
+ 	return method, ok
+ }
+ 
++func (o *Object) LookupSignal(name string) (*Method, bool) {
++	signal, ok := o.signals[name]
++	return signal, ok
++}
++
+ func (o *Object) Call(name string, args ...interface{}) ([]interface{}, error) {
+ 	method, ok := o.LookupMethod(name)
+ 	if !ok {
+@@ -77,6 +121,10 @@ func (o *Object) Methods() map[string]*Method {
+ 	return o.methods
+ }
+ 
++func (o *Object) Signals() map[string]*Method {
++	return o.signals
++}
++
+ type Interface struct {
+ 	typ  *InterfaceType
+ 	impl *Object
+@@ -97,6 +145,14 @@ func (i *Interface) LookupMethod(name string) (*Method, bool) {
+ 	return i.impl.LookupMethod(name)
+ }
+ 
++func (i *Interface) LookupSignal(name string) (*Method, bool) {
++	_, ok := i.typ.signals[name]
++	if !ok {
++		return nil, false
++	}
++	return i.impl.LookupSignal(name)
++}
++
+ func (i *Interface) Call(name string, args ...interface{}) ([]interface{}, error) {
+ 	method, ok := i.LookupMethod(name)
+ 	if !ok {
+@@ -123,12 +179,21 @@ func (i *Interface) Methods() map[string]*Method {
+ 	return out
+ }
+ 
++func (i *Interface) Signals() map[string]*Method {
++	out := make(map[string]*Method)
++	for k, _ := range i.typ.signals {
++		out[k] = i.impl.signals[k]
++	}
++	return out
++}
++
+ type InterfaceType struct {
+ 	methods map[string]reflect.Type
++	signals map[string]reflect.Type
+ }
+ 
+ func NewInterface(obj interface{}) *InterfaceType {
+-	return newInterface(getMethodTypes(obj),
++	return newInterface(getMethodTypes(obj), nil,
+ 		func(in string) string { return in })
+ }
+ 
+@@ -136,20 +201,26 @@ func NewInterfaceMapNames(
+ 	obj interface{},
+ 	mapfn func(string) string,
+ ) *InterfaceType {
+-	return newInterface(getMethodTypes(obj), mapfn)
++	return newInterface(getMethodTypes(obj), nil, mapfn)
+ }
+ 
++func NewInterfaceFromTableSignals(signals map[string]interface{}) *InterfaceType {
++	return newInterface(nil, methodTableToTypes(signals),
++		func(in string) string { return in })
++}
+ func NewInterfaceFromTable(table map[string]interface{}) *InterfaceType {
+-	return newInterface(methodTableToTypes(table),
++	return newInterface(methodTableToTypes(table), nil,
+ 		func(in string) string { return in })
+ }
+ 
+ func newInterface(
+-	table map[string]reflect.Type,
++	methods map[string]reflect.Type,
++	signals map[string]reflect.Type,
+ 	mapfn func(string) string,
+ ) *InterfaceType {
+ 	return &InterfaceType{
+-		methods: mapMethodTypeNames(table, mapfn),
++		methods: mapMethodTypeNames(methods, mapfn),
++		signals: mapMethodTypeNames(signals, mapfn),
+ 	}
+ }
+ 
+diff --git a/method.go b/method.go
+index b8534dd..a5f2f67 100644
+--- a/method.go
++++ b/method.go
+@@ -62,6 +62,46 @@ func (method *Method) Introspect() introspect.Method {
+ 	return intro
+ }
+ 
++func (method *Method) IntrospectSignal() introspect.Signal {
++	getArguments := func(
++		num func() int,
++		get func(int) reflect.Type,
++		typ string,
++	) []introspect.Arg {
++		var args []introspect.Arg
++		for j := 0; j < num(); j++ {
++			arg := get(j)
++			if typ == "out" && j == num()-1 {
++				if arg.Implements(errtype) {
++					continue
++				}
++			}
++			if typ == "in" && arg == sendertype {
++				// Hide argument from introspection
++				continue
++			}
++			iarg := introspect.Arg{
++				"",
++				dbus.SignatureOfType(arg).String(),
++				typ,
++			}
++			args = append(args, iarg)
++		}
++		return args
++	}
++
++	intro := introspect.Signal{
++		Name: method.name,
++		Args: make([]introspect.Arg, 0,
++			method.NumArguments()+method.NumReturns()),
++		Annotations: make([]introspect.Annotation, 0),
++	}
++	intro.Args = append(intro.Args,
++		getArguments(method.NumArguments,
++			method.impl.ArgumentType, "")...)
++	return intro
++}
++
+ func (method *Method) DecodeArguments(
+ 	conn *dbus.Conn,
+ 	sender string,
+diff --git a/object.go b/object.go
+index 1b72754..cce4e4a 100644
+--- a/object.go
++++ b/object.go
+@@ -122,6 +122,17 @@ func (o *Object) NewObjectFromTable(
+ 		reflect.NewObjectFromTable(table))
+ }
+ 
++func (o *Object) NewSignalObjectFromTable(
++	path dbus.ObjectPath,
++	signals map[string]interface{},
++) *Object {
++	if string(path) == "/" {
++		return o
++	}
++	return o.newObject(pathToStringSlice(path),
++		reflect.NewSignalObjectFromTable(signals))
++}
++
+ func (o *Object) NewObjectMap(
+ 	path dbus.ObjectPath,
+ 	val interface{},
+@@ -286,6 +297,20 @@ func (o *Object) ImplementsTable(
+ 	return o.implementsIface(name, iface)
+ 
+ }
++
++func (o *Object) ImplementsSignalsTable(
++	name string,
++	table map[string]interface{},
++) error {
++	iface, err := o.impl.AsInterface(
++		reflect.NewInterfaceFromTableSignals(table))
++	if err != nil {
++		return err
++	}
++	return o.implementsIface(name, iface)
++
++}
++
+ func (o *Object) implementsIface(
+ 	name string,
+ 	iface *reflect.Interface,
+-- 
+2.1.4
+
